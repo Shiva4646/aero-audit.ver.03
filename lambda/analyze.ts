@@ -1,19 +1,65 @@
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 
 const s3 = new S3Client({});
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = "gemini-3.8-flash";
+const GEMINI_MODEL = "gemini-3.5-flash-lite";
+
+export function calculateTangedcoBill(totalUnits: number): number {
+  if (!Number.isFinite(totalUnits) || totalUnits < 0) {
+    throw new Error("totalUnits must be a non-negative number");
+  }
+
+  const tiers = totalUnits <= 500
+    ? [
+        { upTo: 200, rate: 0 },
+        { upTo: 400, rate: 4.7 },
+        { upTo: 500, rate: 6.3 },
+      ]
+    : [
+        { upTo: 100, rate: 0 },
+        { upTo: 400, rate: 4.7 },
+        { upTo: 500, rate: 6.3 },
+        { upTo: 600, rate: 8.4 },
+        { upTo: 800, rate: 9.45 },
+        { upTo: Infinity, rate: 11.25 },
+      ];
+
+  let energyCharge = 0;
+  let previousTierLimit = 0;
+  for (const tier of tiers) {
+    const unitsInTier = Math.max(0, Math.min(totalUnits, tier.upTo) - previousTierLimit);
+    energyCharge += unitsInTier * tier.rate;
+    previousTierLimit = tier.upTo;
+    if (totalUnits <= tier.upTo) break;
+  }
+
+  return Number((energyCharge + 75).toFixed(2));
+}
 
 export const handler = async (event: any) => {
   try {
     const body = JSON.parse(event.body || "{}");
     const fileName = body.fileName;
     if (!fileName) return { statusCode: 400, body: "Missing fileName" };
+
+    const { tonnage, starRating, dailyHours, baseHouseholdUnits } = body;
+    if (
+      typeof tonnage !== "number" || !Number.isFinite(tonnage) || tonnage <= 0 ||
+      typeof starRating !== "number" || !Number.isInteger(starRating) || starRating < 1 || starRating > 5 ||
+      typeof dailyHours !== "number" || !Number.isFinite(dailyHours) || dailyHours < 0 || dailyHours > 24 ||
+      typeof baseHouseholdUnits !== "number" || !Number.isFinite(baseHouseholdUnits) || baseHouseholdUnits < 0
+    ) {
+      return {
+        statusCode: 400,
+        headers: { "Access-Control-Allow-Origin": "*" },
+        body: JSON.stringify({
+          error: "Provide valid tonnage, starRating (1-5), dailyHours (0-24), and non-negative baseHouseholdUnits",
+        }),
+      };
+    }
+
     if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured on the Lambda environment");
 
     // 1. Download image from S3
@@ -35,7 +81,7 @@ export const handler = async (event: any) => {
         role: "user",
         parts: [
           {
-            text: "You are an AI auditor for TANGEDCO. Analyze this AC unit installation. Estimate the clearance between the exhaust fan and the nearest wall/obstruction. If the clearance is severely restricted (less than 1 meter), respond with exactly '<1m'. If there is plenty of breathing room, respond with '>1m'. Do not output any other text.",
+            text: "Analyze the spatial geometry of this AC outdoor unit. Estimate the physical clearance distance between the fan exhaust and the nearest obstruction based on a standard 800mm fan grate width. Return exactly the estimated distance in meters and a one-word description of the obstruction type.",
           },
           {
             inlineData: {
@@ -45,33 +91,74 @@ export const handler = async (event: any) => {
           },
         ],
       }],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            estimated_clearance_meters: { type: Type.NUMBER },
+            obstruction_type: { type: Type.STRING },
+          },
+          required: ["estimated_clearance_meters", "obstruction_type"],
+        },
+      },
     });
 
-    const clearanceBracket = geminiResponse.text?.trim();
-    if (!clearanceBracket) {
+    const responseText = geminiResponse.text;
+    if (!responseText) {
       throw new Error("Gemini API response did not contain an analysis result");
     }
 
-    // 4. Penalty Lookup
-    let penaltyAmount = 0;
-    try {
-        const dbRes = await ddb.send(new GetCommand({
-            TableName: process.env.TABLE_NAME,
-            Key: { clearance_bracket: clearanceBracket }
-        }));
-        penaltyAmount = dbRes.Item?.penalty_amount || 0;
-    } catch (e) {
-        console.log("DynamoDB lookup bypassed/failed", e);
+    const analysisResult: Record<string, unknown> = JSON.parse(responseText);
+    const clearanceMeters = analysisResult.estimated_clearance_meters;
+    if (typeof clearanceMeters !== "number" || !Number.isFinite(clearanceMeters) || clearanceMeters < 0) {
+      throw new Error("Gemini response must include a non-negative estimated_clearance_meters value");
     }
+
+    let efficiencyPenaltyPct: number;
+    if (clearanceMeters >= 1.5) {
+      efficiencyPenaltyPct = 0;
+    } else if (clearanceMeters >= 1.0) {
+      efficiencyPenaltyPct = 0.05;
+    } else if (clearanceMeters >= 0.5) {
+      efficiencyPenaltyPct = 0.15;
+    } else {
+      efficiencyPenaltyPct = 0.25;
+    }
+
+    const base15StarConsumptionKwh: Record<number, number> = {
+      1: 1.75,
+      2: 1.55,
+      3: 1.37,
+      4: 1.20,
+      5: 1.05,
+    };
+    const base15Kwh = base15StarConsumptionKwh[starRating];
+    const actualBaseKwh = base15Kwh * (tonnage / 1.5);
+    const optimalAcUnits = actualBaseKwh * dailyHours * 60;
+    const roundedOptimalAcUnits = Math.round(optimalAcUnits);
+    const degradedAcUnits = Math.round(optimalAcUnits * (1 + efficiencyPenaltyPct));
+    const wastedUnits = degradedAcUnits - roundedOptimalAcUnits;
+    const totalUnits = baseHouseholdUnits + degradedAcUnits;
+    const billAmount = calculateTangedcoBill(totalUnits);
+    const optimalBill = calculateTangedcoBill(baseHouseholdUnits + roundedOptimalAcUnits);
+    const financialPenalty = Number((billAmount - optimalBill).toFixed(2));
+    Object.assign(analysisResult, {
+      efficiency_penalty_pct: efficiencyPenaltyPct,
+      actual_base_kwh: actualBaseKwh,
+      optimal_ac_units: optimalAcUnits,
+      degraded_ac_units: degradedAcUnits,
+      wasted_units: wastedUnits,
+      total_units: totalUnits,
+      bill_amount: billAmount,
+      optimal_bill: optimalBill,
+      financial_penalty: financialPenalty,
+    });
 
     return {
       statusCode: 200,
       headers: { "Access-Control-Allow-Origin": "*" },
-      body: JSON.stringify({
-        clearance: clearanceBracket,
-        penalty_inr: penaltyAmount,
-        verdict: clearanceBracket === "<1m" ? "FAIL: Thermal Short-Circuit Detected" : "PASS: Adequate Clearance"
-      })
+      body: JSON.stringify(analysisResult),
     };
   } catch (error) {
     console.error(error);
