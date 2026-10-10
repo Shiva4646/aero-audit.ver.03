@@ -241,11 +241,7 @@ export default function App() {
                     <div className="bg-orange-950/40 border border-orange-500 p-4 mt-4 rounded-md">
                       <h3 className="font-bold text-orange-400">ENGINEERING REMEDIATION</h3>
                       <p className="mt-2">
-                        Physical relocation is constrained by the solid wall. We strongly recommend
-                        installing a 45-degree aerodynamic condenser air deflector. This lower will
-                        vector the 50°C exhaust upward, permanently breaking the thermal
-                        short-circuit, restoring cooling capacity, and eliminating your ₹
-                        {result.financial_penalty.toFixed(2)} TANGEDCO penalty.
+                        {result.engineering_remediation}
                       </p>
                     </div>
                   )}
@@ -282,10 +278,7 @@ export default function App() {
                           </p>
                           <p>
                             <strong className="text-white">Engineering Remediation:</strong>{' '}
-                            {result.estimated_clearance_meters < 1.0 &&
-                            result.obstruction_type.toLowerCase().includes('wall')
-                              ? 'Because clearance is below 1.0 meter and the obstruction is a wall, a 45-degree louver is recommended to redirect exhaust away from the obstruction.'
-                              : 'The 45-degree louver recommendation applies when clearance is below 1.0 meter and the obstruction is identified as a wall.'}
+                            {result.engineering_remediation}
                           </p>
                         </div>
                 )}

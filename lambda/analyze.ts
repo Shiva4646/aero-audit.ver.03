@@ -81,7 +81,7 @@ export const handler = async (event: any) => {
         role: "user",
         parts: [
           {
-            text: "Analyze the spatial geometry of this AC outdoor unit. Estimate the physical clearance distance between the fan exhaust and the nearest obstruction based on a standard 800mm fan grate width. Return exactly the estimated distance in meters and a one-word description of the obstruction type.",
+            text: "Analyze the spatial geometry and surroundings of this AC outdoor unit. Determine if an outdoor AC unit is present (`is_ac_unit`), estimate clearance in meters, identify the obstruction type, and generate a customized, practical engineering remediation strategy tailored specifically to the visual context of this photo (e.g., specific deflection angles, directional exhaust routing, or clearance adjustments).",
           },
           {
             inlineData: {
@@ -96,10 +96,17 @@ export const handler = async (event: any) => {
         responseSchema: {
           type: Type.OBJECT,
           properties: {
+            is_ac_unit: { type: Type.BOOLEAN },
             estimated_clearance_meters: { type: Type.NUMBER },
             obstruction_type: { type: Type.STRING },
+            engineering_remediation: { type: Type.STRING },
           },
-          required: ["estimated_clearance_meters", "obstruction_type"],
+          required: [
+            "is_ac_unit",
+            "estimated_clearance_meters",
+            "obstruction_type",
+            "engineering_remediation",
+          ],
         },
       },
     });
@@ -110,6 +117,16 @@ export const handler = async (event: any) => {
     }
 
     const analysisResult: Record<string, unknown> = JSON.parse(responseText);
+    if (!analysisResult.is_ac_unit) {
+      return {
+        statusCode: 400,
+        headers: { "Access-Control-Allow-Origin": "*" },
+        body: JSON.stringify({
+          error: "Invalid image: No outdoor AC condenser unit detected. Please upload a valid AC unit photo.",
+        }),
+      };
+    }
+
     const clearanceMeters = analysisResult.estimated_clearance_meters;
     if (typeof clearanceMeters !== "number" || !Number.isFinite(clearanceMeters) || clearanceMeters < 0) {
       throw new Error("Gemini response must include a non-negative estimated_clearance_meters value");
